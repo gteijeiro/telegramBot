@@ -1,295 +1,259 @@
-import asyncio
-import base64
-import json
-import logging
-import os
-import sys
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import os, io, base64, logging, asyncio
+from pathlib import Path
+from typing import Optional, List
 
-from dotenv import load_dotenv
-from telegram import Update, File
-from telegram.constants import ParseMode
+from dotenv import load_dotenv, find_dotenv
+from pydantic import BaseModel, Field
+from openai import AzureOpenAI
+from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# Azure OpenAI client
-try:
-    from openai import AzureOpenAI
-except Exception as exc:
-    AzureOpenAI = None  # type: ignore
-
-
+# ─────────── logging ───────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger("invoice-bot")
+log = logging.getLogger("invoice-bot")
 
+# ─────────── .env ───────────
+load_dotenv(find_dotenv(usecwd=True, raise_error_if_not_found=False))
 
-INVOICE_JSON_SCHEMA_EXAMPLE = {
-    "vendor_name": None,
-    "vendor_tax_id": None,
-    "invoice_number": None,
-    "invoice_date": None,  # ISO 8601, e.g. 2024-08-31
-    "due_date": None,      # ISO 8601
-    "currency": None,      # e.g. USD, EUR
-    "subtotal_amount": None,
-    "tax_amount": None,
-    "total_amount": None,
-    "purchase_order_number": None,
-    "payment_terms": None,
-    "bill_to": {
-        "name": None,
-        "address": None,
-        "tax_id": None,
-    },
-    "ship_to": {
-        "name": None,
-        "address": None,
-        "tax_id": None,
-    },
-    "line_items": [
-        {
-            "description": None,
-            "sku": None,
-            "quantity": None,
-            "unit_price": None,
-            "total": None,
-        }
-    ],
-    "notes": None,
-}
+def require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
 
+# ─────────── config ───────────
+TELEGRAM_TOKEN = require_env("TELEGRAM_TOKEN")
+AZURE_OPENAI_ENDPOINT = require_env("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = require_env("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+
+# PDF render config
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "5"))   # límite de páginas por PDF
+PDF_DPI = int(os.getenv("PDF_DPI", "200"))             # resolución de render
+PDF_JPEG_QUALITY = int(os.getenv("PDF_JPEG_QUALITY", "85"))
+
+# ─────────── azure client ───────────
+client = AzureOpenAI(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+)
+
+# ─────────── modelos (Structured Outputs) ───────────
+class Party(BaseModel):
+    name: Optional[str] = None
+    tax_id: Optional[str] = None
+    address: Optional[str] = None
+
+class Tax(BaseModel):
+    name: str
+    amount: float
+    rate: Optional[float] = None
+
+class LineItem(BaseModel):
+    description: str
+    quantity: Optional[float] = None
+    unit_price: Optional[float] = None
+    amount: Optional[float] = None
+
+class Invoice(BaseModel):
+    is_invoice: bool = Field(..., description="True if the document is an invoice; false otherwise")
+    document_type: str = Field(..., description="Detected document type (e.g., invoice, receipt)")
+    language: Optional[str] = None
+    ocr_confidence: Optional[float] = None
+
+    invoice_number: Optional[str] = None
+    issue_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+    due_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+    po_number: Optional[str] = None
+    currency: Optional[str] = Field(None, description="ISO 4217")
+
+    seller: Party = Field(default_factory=Party)
+    buyer: Party = Field(default_factory=Party)
+
+    subtotal_amount: Optional[float] = None
+    total_tax_amount: Optional[float] = None
+    total_amount: Optional[float] = None
+
+    taxes: List[Tax] = Field(default_factory=list)
+    line_items: List[LineItem] = Field(default_factory=list)
+
+    payment_terms: Optional[str] = None
+    notes: Optional[str] = None
 
 SYSTEM_PROMPT = (
-    "You are an expert invoice information extractor. "
-    "Given one or more invoice images and optional user text hints, extract as many fields as possible and respond strictly as a compact JSON object. "
-    "All property names must be in English. Use ISO 8601 dates (YYYY-MM-DD). "
-    "Include line items when present. If a field is unknown, use null. Do not add explanations. "
-    "Ensure numeric fields are numbers, not strings."
+    "You are an expert OCR and invoice parser. "
+    "Read the provided image(s) of an invoice and extract fields strictly into the provided schema. "
+    "Rules: dates in ISO 8601 (YYYY-MM-DD); currency as ISO 4217; numbers with dot decimal; "
+    "return null when unknown; do not invent values; "
+    "set is_invoice=false if it's not an invoice."
 )
 
-
-@dataclass
-class AzureConfig:
-    endpoint: str
-    api_key: str
-    api_version: str
-    deployment: str
-
-
-def load_config_from_env() -> AzureConfig:
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview").strip()
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o").strip()
-
-    if not endpoint:
-        raise RuntimeError("AZURE_OPENAI_ENDPOINT is required")
-    if not api_key:
-        raise RuntimeError("AZURE_OPENAI_API_KEY is required")
-    if not deployment:
-        raise RuntimeError("AZURE_OPENAI_DEPLOYMENT is required")
-
-    return AzureConfig(endpoint=endpoint, api_key=api_key, api_version=api_version, deployment=deployment)
-
-
-def build_client(cfg: AzureConfig):
-    if AzureOpenAI is None:
-        raise RuntimeError("openai package with AzureOpenAI client is not available. Please check dependencies.")
-    client = AzureOpenAI(
-        api_key=cfg.api_key,
-        api_version=cfg.api_version,
-        azure_endpoint=cfg.endpoint,
-    )
-    return client
-
-
-def image_bytes_to_data_url(image_bytes: bytes, mime: str = "image/jpeg") -> str:
-    b64 = base64.b64encode(image_bytes).decode("ascii")
+# ─────────── helpers ───────────
+def bytes_to_data_url(data: bytes, mime: str = "image/jpeg") -> str:
+    b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
+def pdf_to_image_data_urls(pdf_bytes: bytes, dpi: int, max_pages: int) -> List[str]:
+    import fitz  # PyMuPDF
+    urls: List[str] = []
+    pages_rendered = 0
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        log.info("PDF abierto: %d páginas (máx a procesar: %d) | DPI=%d | Quality=%d",
+                 doc.page_count, max_pages, dpi, PDF_JPEG_QUALITY)
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes(output="jpg", jpg_quality=PDF_JPEG_QUALITY)
+            urls.append(bytes_to_data_url(img_bytes, mime="image/jpeg"))
+            pages_rendered += 1
+    log.info("PDF renderizado: %d página(s) convertidas a imagen", pages_rendered)
+    return urls
 
-async def fetch_file_bytes(file: File) -> bytes:
-    # python-telegram-bot v21: download_to_memory returns BytesIO
-    bio = await file.download_to_memory()
-    return bio.getvalue()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("Comando /start de %s (%s)", update.effective_user.username, update.effective_user.id)
+    await update.message.reply_text(
+        "Envíame una **foto** o un **PDF** de la factura y te devuelvo JSON (propiedades en inglés)."
+    )
 
+# Fotos enviadas como PHOTO
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.photo:
+        return
+    log.info("Foto recibida de chat %s. Resoluciones: %s",
+             msg.chat_id, [ (p.width, p.height) for p in msg.photo ])
+    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
-def ensure_json(text: str) -> str:
-    """Best-effort to return a minified JSON string; fall back to original if parsing fails."""
+    photo = msg.photo[-1]
+    f = await photo.get_file()
+    bio = io.BytesIO()
+    await f.download_to_memory(out=bio)
+    size = bio.tell()
+    bio.seek(0)
+    log.info("Foto descargada: %d bytes", size)
+
+    data_url = bytes_to_data_url(bio.read(), mime="image/jpeg")
+    await analyze_and_reply([data_url], msg, context)
+
+# Imágenes adjuntas como DOCUMENT
+async def handle_image_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.document:
+        return
+    mime = (msg.document.mime_type or "").lower()
+    if not mime.startswith("image/"):
+        return
+    log.info("Imagen (document) recibida: mime=%s nombre=%s tamaño=%s bytes",
+             mime, msg.document.file_name, msg.document.file_size)
+    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+
+    f = await msg.document.get_file()
+    bio = io.BytesIO()
+    await f.download_to_memory(out=bio)
+    size = bio.tell()
+    bio.seek(0)
+    log.info("Imagen descargada: %d bytes", size)
+
+    data_url = bytes_to_data_url(bio.read(), mime=mime if mime.startswith("image/") else "image/jpeg")
+    await analyze_and_reply([data_url], msg, context)
+
+# PDF adjunto como DOCUMENT
+async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.document:
+        return
+    mime = (msg.document.mime_type or "").lower()
+    if mime != "application/pdf":
+        return
+    log.info("PDF recibido: nombre=%s tamaño=%s bytes",
+             msg.document.file_name, msg.document.file_size)
+    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+
+    f = await msg.document.get_file()
+    pdf_io = io.BytesIO()
+    await f.download_to_memory(out=pdf_io)
+    size = pdf_io.tell()
+    pdf_io.seek(0)
+    log.info("PDF descargado: %d bytes", size)
+
     try:
-        parsed = json.loads(text)
-        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        return text
+        # enviar al pool para no bloquear el loop
+        images_data_urls = await asyncio.to_thread(
+            pdf_to_image_data_urls,
+            pdf_io.read(),
+            PDF_DPI,
+            MAX_PDF_PAGES
+        )
+        if not images_data_urls:
+            log.warning("PDF sin páginas renderizadas")
+            await msg.reply_text("No pude renderizar páginas del PDF.")
+            return
+        await analyze_and_reply(images_data_urls, msg, context)
+    except Exception as e:
+        log.exception("Fallo en PDF->imagen")
+        await msg.reply_text(f"Error al convertir el PDF a imágenes: {e}")
 
-
-async def call_azure_openai_with_image(
-    client: Any,
-    cfg: AzureConfig,
-    image_bytes: bytes,
-    hint_text: Optional[str] = None,
-    default_currency: Optional[str] = None,
-) -> str:
-    data_url = image_bytes_to_data_url(image_bytes)
-
-    user_text = (
-        (hint_text or "").strip()
-        + (f"\nDefault currency (if missing): {default_currency}" if default_currency else "")
-    ).strip()
-
-    content_blocks: list[dict[str, Any]] = []
-    if user_text:
-        content_blocks.append({"type": "text", "text": user_text})
-    content_blocks.append({
-        "type": "image_url",
-        "image_url": {"url": data_url},
-    })
-
+# Llamada a Azure + respuesta JSON
+async def analyze_and_reply(image_urls: List[str], msg, context):
     try:
-        resp = client.chat.completions.create(
-            model=cfg.deployment,
-            temperature=0,
-            response_format={"type": "json_object"},
+        log.info("Preparando petición a Azure: %d imagen(es)", len(image_urls))
+        content_parts = [{"type": "text", "text": "Extract all invoice fields following the response schema."}]
+        for url in image_urls:
+            content_parts.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
+
+        # === IMPORTANTE: temperature y max_completion_tokens removidos (no necesarios) ===
+        completion = client.beta.chat.completions.parse(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            # temperature=0,
+            # max_completion_tokens=1500,
+            response_format=Invoice,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content_blocks},
+                {"role": "user", "content": content_parts},
             ],
         )
-        text = resp.choices[0].message.content
-        return ensure_json(text)
-    except Exception as exc:
-        logger.exception("Azure OpenAI request failed")
-        return json.dumps({
-            "error": "azure_openai_request_failed",
-            "message": str(exc),
-        })
+        log.info("Respuesta recibida de Azure")
 
+        parsed = completion.choices[0].message.parsed
+        # pydantic v2: sin ensure_ascii
+        json_text = parsed.model_dump_json(indent=2)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Hola! Envía una foto de una factura (o un documento de imagen).\n"
-        "Opcionalmente añade texto con pistas. Te devolveré un JSON con los datos extraídos."
+        # Log de campos clave sin volcar todo el JSON en logs
+        log.info(
+            "Parseo OK | is_invoice=%s | invoice_number=%s | total_amount=%s",
+            parsed.is_invoice,
+            getattr(parsed, "invoice_number", None),
+            getattr(parsed, "total_amount", None),
+        )
+
+        await msg.reply_text(f"```json\n{json_text}\n```", parse_mode="Markdown")
+    except Exception as e:
+        log.exception("Azure OpenAI error")
+        await msg.reply_text(f"Sorry, I couldn't parse the invoice.\nError: {e}")
+
+def main():
+    log.info(
+        "Iniciando bot | Endpoint=%s | Deployment=%s | APIv=%s | MAX_PDF_PAGES=%d | PDF_DPI=%d | JPEG_Q=%d",
+        AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION,
+        MAX_PDF_PAGES, PDF_DPI, PDF_JPEG_QUALITY
     )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Instrucciones:\n"
-        "- Envía una foto nítida de la factura.\n"
-        "- Puedes añadir un mensaje con pistas (p. ej., moneda por defecto).\n"
-        "- Recibirás un JSON con propiedades en inglés."
-    )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Store last hint to use if next message is an image
-    text = update.message.text or ""
-    context.user_data["last_hint_text"] = text
-    await update.message.reply_text(
-        "Gracias. Ahora envía la imagen de la factura para extraer los datos."
-    )
-
-
-async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    hint_text: Optional[str] = context.user_data.get("last_hint_text")
-    default_currency = os.getenv("DEFAULT_CURRENCY")
-
-    # Determine if it's a photo or an image document
-    file: Optional[File] = None
-    mime: str = "image/jpeg"
-
-    if update.message.photo:
-        # Take the highest resolution photo
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        mime = "image/jpeg"
-    elif update.message.document:
-        doc = update.message.document
-        if doc.mime_type and doc.mime_type.startswith("image/"):
-            file = await context.bot.get_file(doc.file_id)
-            mime = doc.mime_type
-        else:
-            await update.message.reply_text("El documento no es una imagen compatible.")
-            return
-
-    if not file:
-        await update.message.reply_text("No se pudo obtener la imagen.")
-        return
-
-    try:
-        image_bytes = await fetch_file_bytes(file)
-    except Exception as exc:
-        logger.exception("Error descargando la imagen de Telegram")
-        await update.message.reply_text("Error descargando la imagen.")
-        return
-
-    try:
-        cfg = load_config_from_env()
-        client = build_client(cfg)
-    except Exception as exc:
-        logger.exception("Configuración de Azure OpenAI inválida")
-        await update.message.reply_text(f"Configuración inválida: {exc}")
-        return
-
-    await update.message.chat.send_action(action="typing")
-
-    result_json = await call_azure_openai_with_image(
-        client=client,
-        cfg=cfg,
-        image_bytes=image_bytes,
-        hint_text=hint_text,
-        default_currency=default_currency,
-    )
-
-    # Telegram has message size limits; keep it compact
-    compact = ensure_json(result_json)
-
-    if len(compact) > 3800:
-        compact = compact[:3700] + "..."
-
-    await update.message.reply_text(compact, parse_mode=None)
-
-
-async def main() -> None:
-    load_dotenv()
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
-
-    app = ApplicationBuilder().token(token).build()
-
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_or_document))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo_or_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Bot started. Listening for messages...")
-    await app.run_polling(close_loop=False)
-
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.MimeType("application/pdf"), handle_pdf_document))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image_document))
+    log.info("Bot corriendo. Presioná Ctrl+C para salir.")
+    app.run_polling()
 
 if __name__ == "__main__":
-    # Lightweight check flag to test imports without running polling
-    if "--check" in sys.argv:
-        try:
-            load_dotenv()
-            _ = load_config_from_env()
-            print("OK: Configuration loaded")
-        except Exception as e:
-            print(f"Config error: {e}")
-        sys.exit(0)
-
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    main()
